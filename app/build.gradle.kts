@@ -11,6 +11,9 @@ plugins {
 
     // Apply the application plugin to add support for building a CLI application in Java.
     application
+
+    // Plugin required to enable @Serializable annotation (uses the same version as the Kotlin plugin)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 repositories {
@@ -39,6 +42,9 @@ dependencies {
     // HTTP client
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Serialization
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+
     // Tests
     testImplementation(kotlin("test"))
 }
@@ -52,7 +58,7 @@ java {
 
 application {
     // Define the main class for the application.
-    mainClass = "org.example.AppKt"
+    mainClass = "com.joger.bookfetcher.AppKt"
 }
 
 tasks.named<Test>("test") {
