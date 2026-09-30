@@ -31,10 +31,9 @@ dependencies {
     implementation(libs.guava)
 
     // CLI argument parser
-    implementation("com.github.ajalt.clikt:clikt:4.4.0")
-
-    // Terminal colors and tables
-    implementation("com.github.ajalt.mordant:mordant:2.4.0")
+    implementation("com.github.ajalt.clikt:clikt:5.0.1")   // Terminal colors and tables
+    implementation("com.github.ajalt.mordant:mordant:3.1.0")
+    implementation("com.github.ajalt.mordant:mordant-coroutines:3.1.0")
 
     // HTML scraping for public domain sites
     implementation("org.jsoup:jsoup:1.17.2")
@@ -64,4 +63,9 @@ application {
 tasks.named<Test>("test") {
     // Use JUnit Platform for unit tests.
     useJUnitPlatform()
+}
+
+tasks.named<JavaExec>("run") {
+    // Forward host terminal input stream to the application process
+    standardInput = System.`in`
 }
