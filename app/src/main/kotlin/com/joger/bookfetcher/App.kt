@@ -12,115 +12,141 @@ import com.github.ajalt.mordant.input.interactiveSelectList
 import java.util.concurrent.TimeUnit
 import kotlinx.serialization.*
 import kotlinx.serialization.json.*
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.Protocol
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
+import org.json.JSONObject
 
-@Serializable
-data class Author(
-    val name: String
-)
-
-@Serializable
-data class Book(
-    val id: Int,
-    val title: String,
-    val authors: List<Author> = emptyList(),
-    // Formats maps MIME types to download links
-    val formats: Map<String, String> = emptyMap()
-)
-
-@Serializable
-data class GutendexResponse(
-    // Access the results array directly via this property
-    val results: List<Book>
-)
-
-val jsonParser = Json {
-    ignoreUnknownKeys = true
-}
-
-fun getBooks(author: String?, title: String?, language: String?): GutendexResponse {
+fun downloadFirstPublicEpub(query: String) {
     val client = OkHttpClient.Builder()
-        .protocols(listOf(Protocol.HTTP_1_1))
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(true)
         .build()
 
-    val request = Request.Builder()
-        .url("https://gutendex.com/books?search=$author%20$title&languages=$language")
+    val searchUrl = "https://openlibrary.org/search.json".toHttpUrl().newBuilder()
+        .addQueryParameter("q", query)
+        .addQueryParameter("fields", "title,ia,ebook_access")
+        .addQueryParameter("limit", "15")
         .build()
 
-    client.newCall(request).execute().use { response ->
-        val body = response.body?.string() ?: ""
-        val book = jsonParser.decodeFromString<GutendexResponse>(body)
-        return book
-    }
-}
+    val searchRequest = Request.Builder().url(searchUrl).build()
 
-fun downloadBook(book: Book, destinationFile: File) {
-    val client = OkHttpClient.Builder()
-        .protocols(listOf(Protocol.HTTP_1_1))
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
+    val candidateEntries = mutableListOf<Pair<String, String>>()
 
-    val request = Request.Builder()
-        .url(book.formats["application/epub+zip"] ?: "")
-        .build()
+    client.newCall(searchRequest).execute().use { response ->
+        if (!response.isSuccessful) throw IOException("Open Library search failed ${response.code}")
 
-    client.newCall(request).execute().use { response ->
-        if (!response.isSuccessful) {
-            error("Download failed with HTTP code: ${response.code}")
-        }
+        val bodyString = response.body?.string() ?: return
+        val json = JSONObject(bodyString)
+        val docs = json.optJSONArray("docs") ?: return
 
-        val body = response.body ?: error("Empty response body")
+        for (i in 0 until docs.length()) {
+            val doc = docs.getJSONObject(i)
+            val ebookAccess = doc.optString("ebook_access")
+            val iaArray = doc.optJSONArray("ia")
+            val title = doc.optString("title", "Unknow Title")
 
-        // Stream binary data directly to the local file
-        body.byteStream().use { inputStream ->
-            FileOutputStream(destinationFile).use { outputStream ->
-                inputStream.copyTo(outputStream)
+            if (ebookAccess == "public" && iaArray != null) {
+                for (j in 0 until iaArray.length()) {
+                    candidateEntries.add(Pair(iaArray.getString(j), title))
+                }
             }
         }
     }
+
+    if (candidateEntries.isEmpty()) {
+        println("No public EPUB found for query: $query")
+        return
+    }
+
+    var selectedIaId: String? = null
+    var selectedBookTitle: String? = null
+    var epubFileName: String? = null
+
+    for ((iaId, title) in candidateEntries) {
+        val metadataUrl = "https://archive.org/metadata/$iaId/files"
+        val metadataRequest = Request.Builder().url(metadataUrl).build()
+
+        try {
+            client.newCall(metadataRequest).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("Internet Archive metadata request failed: ${response.code}")
+
+                val bodyString = response.body?.string() ?: return
+                val json = JSONObject(bodyString)
+                val files = json.optJSONArray("result") ?: return
+
+                for (i in 0 until files.length()) {
+                    val fileObj = files.getJSONObject(i)
+                    val format = fileObj.optString("format")
+                    val name = fileObj.optString("name")
+
+                    if (format.equals("EPUB", ignoreCase = true) || name.endsWith(".epub", ignoreCase = true)) {
+                        epubFileName = name
+                        selectedIaId = iaId
+                        selectedBookTitle = title
+                        return@use
+                    }
+                }
+            }
+        } catch (_: Exception) {
+
+        }
+
+        if (epubFileName != null) break
+    }
+
+    if (epubFileName == null || selectedIaId == null) {
+        println("No downloadable EPUB found among public candidates for: $query")
+        return
+    }
+
+    println("Found candidate: '$selectedBookTitle' (IA ID: $selectedIaId)")
+
+    val downloadUrl = "https://archive.org/download/$selectedIaId/$epubFileName"
+    val downloadRequest = Request.Builder()
+        .url(downloadUrl)
+        .build()
+
+    val outputFile = File("$selectedIaId.epub")
+    println("Downloading from: $downloadUrl")
+
+    client.newCall(downloadRequest).execute().use { response ->
+        if (!response.isSuccessful) throw IOException("Download failed with code ${response.code}")
+
+        val body = response.body ?: throw IOException("Empty response body")
+        body.byteStream().use { input ->
+            FileOutputStream(outputFile).use { output ->
+                input.copyTo(output)
+            }
+        }
+    }
+
+    println("Saved EPUB to: ${outputFile.absolutePath}")
 }
 
 class Fetcher : CliktCommand() {
-    val bookTitle: String? by option()
-    val bookAuthor: String? by option()
-    val bookLanguage: String? by option()
+    private val bookTitle: String? by option("--book-title", help = "Title of the book")
+    private val bookAuthor: String? by option("--book-author", help = "Author of the book")
+    private val bookLanguage: String? by option("--book-language", help = "Language code")
 
     override fun run() {
-        if (bookTitle.isNullOrBlank() && bookAuthor.isNullOrBlank()) {
+        val title = bookTitle?.trim().orEmpty()
+        val author = bookAuthor?.trim().orEmpty()
+
+        if (title.isBlank() && author.isBlank()) {
             echo("Error: Please provide at least --book-title or --book-author.")
             return
         }
 
         println("bookTitle: $bookTitle, bookAuthor: $bookAuthor, bookLanguage: $bookLanguage")
-        val book = getBooks(bookAuthor, bookTitle, bookLanguage)
 
-        val terminal = Terminal()
-        val books = book.results
-        val booksByTitle = books.associateBy { it.title }
-        val selectedTitle = terminal.interactiveSelectList(
-            entries = booksByTitle.keys,
-            title = "Select a book",
-        )
-
-        if (selectedTitle == null) {
-            terminal.danger("Aborted book selection")
-        } else {
-            val selectedBook = booksByTitle[selectedTitle]!!
-            terminal.success("You selected: ${selectedBook.title}")
-            val safeName = selectedBook.title.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-            val destinationFile = File("$safeName.epub")
-            downloadBook(selectedBook, destinationFile)
-        }
+        val query = listOf(title, author).filter { it.isNotBlank() }.joinToString(" ")
+        println("Searching for: $query")
+        downloadFirstPublicEpub(query)
     }
 }
 
